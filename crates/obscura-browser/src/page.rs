@@ -206,9 +206,93 @@ impl Page {
         false
     }
 
-    /// 统一拦截入口：如果 Fetch 拦截已启用，将子资源请求也发送到 CDP 客户端，
-    /// 由 Go 端通过 Fetch.fulfillRequest / Fetch.continueRequest 决定如何处理。
-    /// 返回 None 表示该资源被阻止加载；返回 Some(Response) 表示获取成功。
+    /// Continue 后自行 fetch，响应阶段的 301/302 也发送 CDP 事件供 handler 决策。
+    async fn do_fetch_with_intercept_loop(
+        &mut self,
+        initial_method: &str,
+        initial_url: &Url,
+        initial_body: &str,
+        resource_type: &str,
+    ) -> Result<obscura_net::Response, ObscuraNetError> {
+        let mut current_url = initial_url.clone();
+        let mut current_method = initial_method.to_string();
+        let mut current_body = initial_body.to_string();
+
+        for _ in 0..20 {
+            // 发送请求
+            let resp = if current_method == "POST" {
+                self.http_client.post_form(&current_url, &current_body).await?
+            } else {
+                self.http_client.fetch(&current_url).await?
+            };
+
+            // 非重定向 → 直接返回
+            if resp.status < 300 || resp.status >= 400 {
+                return Ok(resp);
+            }
+
+            // 重定向：发送响应阶段 CDP 事件
+            if self.intercept_enabled {
+                if let Some(ref tx) = self.intercept_tx {
+                    let (resolver_tx, resolver_rx) = tokio::sync::oneshot::channel();
+                    let request_id = format!("redir-{}", self.network_event_counter);
+                    self.network_event_counter += 1;
+
+                    let intercepted = InterceptedRequest {
+                        request_id,
+                        url: current_url.to_string(),
+                        method: current_method.clone(),
+                        headers: std::collections::HashMap::new(),
+                        resource_type: resource_type.to_string(),
+                        resolver: resolver_tx,
+                        response_status_code: Some(resp.status),
+                        response_headers: Some(resp.headers.clone()),
+                    };
+
+                    let _ = tx.send(intercepted);
+
+                    match resolver_rx.await {
+                        Ok(InterceptResolution::Fulfill { status, headers: resp_headers, body }) => {
+                            let body_bytes = body.into_bytes();
+                            return Ok(obscura_net::Response {
+                                url: current_url,
+                                status,
+                                headers: resp_headers,
+                                body: body_bytes,
+                                redirected_from: Vec::new(),
+                            });
+                        }
+                        Ok(InterceptResolution::Fail { reason }) => {
+                            return Err(ObscuraNetError::Network(reason));
+                        }
+                        Ok(InterceptResolution::Continue { .. }) | Err(_) => {
+                            // Follow: 提取 Location 继续循环
+                        }
+                    }
+                }
+            }
+
+            // 提取 Location
+            let location = resp.headers.get("location")
+                .or_else(|| resp.headers.get("Location"))
+                .cloned();
+            match location {
+                Some(loc) => {
+                    match current_url.join(&loc) {
+                        Ok(new_url) => {
+                            current_url = new_url;
+                            current_method = "GET".to_string();
+                            current_body = String::new();
+                            continue;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                None => return Ok(resp),
+            }
+        }
+        Err(ObscuraNetError::TooManyRedirects(current_url.to_string()))
+    }
     async fn fetch_url_with_intercept(
         &mut self,
         url_str: &str,
@@ -233,6 +317,8 @@ impl Page {
                         headers: req_headers,
                         resource_type: resource_type.to_string(),
                         resolver: resolver_tx,
+                        response_status_code: None,
+                        response_headers: None,
                     };
 
                     let _ = tx.send(intercepted);
@@ -744,6 +830,8 @@ impl Page {
                         headers: req_headers,
                         resource_type: "Document".to_string(),
                         resolver: resolver_tx,
+                        response_status_code: None,
+                        response_headers: None,
                     };
 
                     let _ = tx.send(intercepted);
@@ -763,12 +851,8 @@ impl Page {
                             Err(ObscuraNetError::Network(reason))
                         }
                         Ok(InterceptResolution::Continue { .. }) | Err(_) => {
-                            // 继续走正常请求路径
-                            if method == "POST" {
-                                self.http_client.post_form(&url, body).await
-                            } else {
-                                self.do_fetch(&url).await
-                            }
+                            // Continue: obscura 自行 fetch，响应阶段的 301/302 也发送 CDP 事件
+                            self.do_fetch_with_intercept_loop(method, &url, body, "Document").await
                         }
                     }
                 } else {

@@ -388,6 +388,14 @@ async fn process_with_interception(
                 });
                 let _ = reply_tx.send(rws_event.to_string());
 
+                let resp_status = intercepted.response_status_code;
+                let resp_headers_val: Option<serde_json::Value> = intercepted.response_headers.as_ref().map(|h| {
+                    let mut map = serde_json::Map::new();
+                    for (k, v) in h {
+                        map.insert(k.clone(), serde_json::Value::String(v.clone()));
+                    }
+                    serde_json::Value::Object(map)
+                });
                 let event_json = json!({
                     "method": "Fetch.requestPaused",
                     "params": {
@@ -403,8 +411,8 @@ async fn process_with_interception(
                         "resourceType": intercepted.resource_type,
                         "networkId": intercepted.request_id,
                         "responseErrorReason": null,
-                        "responseStatusCode": null,
-                        "responseHeaders": null,
+                        "responseStatusCode": resp_status,
+                        "responseHeaders": resp_headers_val,
                     },
                     "sessionId": session_for_events,
                 });

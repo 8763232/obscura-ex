@@ -36,6 +36,9 @@ pub struct InterceptedRequest {
     pub headers: HashMap<String, String>,
     pub resource_type: String,
     pub resolver: tokio::sync::oneshot::Sender<InterceptResolution>,
+    // 响应阶段字段（None = 请求阶段）
+    pub response_status_code: Option<u16>,
+    pub response_headers: Option<HashMap<String, String>>,
 }
 
 pub struct ObscuraState {
@@ -377,6 +380,8 @@ async fn op_fetch_url(
             headers: custom_headers.clone(),
             resource_type: "Fetch".to_string(),
             resolver: resolve_tx,
+            response_status_code: None,
+            response_headers: None,
         };
         if tx.send(intercepted).is_ok() {
             match resolve_rx.await {
