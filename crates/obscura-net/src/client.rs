@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, USER_AGENT};
@@ -155,7 +156,7 @@ async fn fetch_file_url(url: &Url) -> Result<Response, ObscuraNetError> {
 }
 
 pub struct ObscuraHttpClient {
-    client: tokio::sync::OnceCell<Client>,
+    client: tokio::sync::RwLock<Option<Client>>,
     proxy_url: Option<String>,
     pub cookie_jar: Arc<CookieJar>,
     pub user_agent: RwLock<String>,
@@ -166,6 +167,7 @@ pub struct ObscuraHttpClient {
     pub timeout: Duration,
     pub in_flight: Arc<std::sync::atomic::AtomicU32>,
     pub block_trackers: bool,
+    pub allow_invalid_certs: AtomicBool,
 }
 
 impl ObscuraHttpClient {
@@ -179,7 +181,7 @@ impl ObscuraHttpClient {
 
     pub fn with_options(cookie_jar: Arc<CookieJar>, proxy_url: Option<&str>) -> Self {
         ObscuraHttpClient {
-            client: tokio::sync::OnceCell::new(),
+            client: tokio::sync::RwLock::new(None),
             proxy_url: proxy_url.map(|s| s.to_string()),
             cookie_jar,
             user_agent: RwLock::new(
@@ -192,25 +194,47 @@ impl ObscuraHttpClient {
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             timeout: Duration::from_secs(30),
             block_trackers: false,
+            allow_invalid_certs: AtomicBool::new(false),
         }
     }
 
-    async fn get_client(&self) -> &Client {
-        self.client.get_or_init(|| async {
-            let mut builder = Client::builder()
-                .redirect(Policy::none())
-                .timeout(Duration::from_secs(30))
-                .danger_accept_invalid_certs(false)
-;
+    async fn get_or_build_client(&self) -> Client {
+        let mut builder = Client::builder()
+            .redirect(Policy::none())
+            .timeout(Duration::from_secs(30))
+            .danger_accept_invalid_certs(self.allow_invalid_certs.load(Ordering::Relaxed));
 
-            if let Some(ref proxy) = self.proxy_url {
-                if let Ok(p) = reqwest::Proxy::all(proxy.as_str()) {
-                    builder = builder.proxy(p);
-                }
+        if let Some(ref proxy) = self.proxy_url {
+            if let Ok(p) = reqwest::Proxy::all(proxy.as_str()) {
+                builder = builder.proxy(p);
             }
+        }
 
-            builder.build().expect("failed to build HTTP client")
-        }).await
+        builder.build().expect("failed to build HTTP client")
+    }
+
+    pub fn set_allow_invalid_certs(&self, allow: bool) {
+        self.allow_invalid_certs.store(allow, Ordering::Relaxed);
+        // 清除缓存的客户端，下次请求时用新设置重建
+        if let Ok(mut guard) = self.client.try_write() {
+            *guard = None;
+        }
+    }
+
+    async fn get_client(&self) -> Client {
+        {
+            let cached = self.client.read().await;
+            if let Some(ref client) = *cached {
+                return client.clone();
+            }
+        }
+        let mut guard = self.client.write().await;
+        if let Some(ref client) = *guard {
+            return client.clone();
+        }
+        let client = self.get_or_build_client().await;
+        *guard = Some(client.clone());
+        client
     }
 
     /// Read-only accessor for the proxy URL the client was configured with

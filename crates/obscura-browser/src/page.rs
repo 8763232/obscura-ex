@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use obscura_dom::{parse_html, DomTree};
+use obscura_js::ops::{InterceptResolution, InterceptedRequest};
 use obscura_js::runtime::ObscuraJsRuntime;
 use obscura_net::{ObscuraHttpClient, ObscuraNetError, Response};
 use url::Url;
@@ -205,6 +206,91 @@ impl Page {
         false
     }
 
+    /// 统一拦截入口：如果 Fetch 拦截已启用，将子资源请求也发送到 CDP 客户端，
+    /// 由 Go 端通过 Fetch.fulfillRequest / Fetch.continueRequest 决定如何处理。
+    /// 返回 None 表示该资源被阻止加载；返回 Some(Response) 表示获取成功。
+    async fn fetch_url_with_intercept(
+        &mut self,
+        url_str: &str,
+        resource_type: &str,
+        method: &str,
+        body: &str,
+    ) -> Option<obscura_net::Response> {
+        if self.intercept_enabled {
+            if self.should_block_url(url_str) {
+                if let Some(ref tx) = self.intercept_tx {
+                    let (resolver_tx, resolver_rx) = tokio::sync::oneshot::channel();
+                    let request_id = format!("sub-{}", self.network_event_counter);
+                    self.network_event_counter += 1;
+
+                    let mut req_headers = std::collections::HashMap::new();
+                    req_headers.insert("user-agent".to_string(), "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36".to_string());
+
+                    let intercepted = InterceptedRequest {
+                        request_id,
+                        url: url_str.to_string(),
+                        method: method.to_string(),
+                        headers: req_headers,
+                        resource_type: resource_type.to_string(),
+                        resolver: resolver_tx,
+                    };
+
+                    let _ = tx.send(intercepted);
+
+                    match resolver_rx.await {
+                        Ok(InterceptResolution::Fulfill { status, headers: resp_headers, body }) => {
+                            let body_bytes = body.into_bytes();
+                            self.record_network_event(url_str, method, resource_type, status, &resp_headers, body_bytes.len());
+                            let parsed = Url::parse(url_str).unwrap();
+                            return Some(obscura_net::Response {
+                                url: parsed,
+                                status,
+                                headers: resp_headers,
+                                body: body_bytes,
+                                redirected_from: Vec::new(),
+                            });
+                        }
+                        Ok(InterceptResolution::Fail { .. }) => {
+                            return None; // 资源被阻止
+                        }
+                        Ok(InterceptResolution::Continue { .. }) | Err(_) => {
+                            // 继续走正常请求
+                        }
+                    }
+                } else {
+                    // intercept_enabled 但 intercept_tx 未设置，仅阻塞
+                    return None;
+                }
+            }
+        }
+
+        // 正常请求路径
+        let parsed = match Url::parse(url_str) {
+            Ok(u) => u,
+            Err(e) => {
+                tracing::warn!("Invalid URL {}: {}", url_str, e);
+                return None;
+            }
+        };
+
+        let fetch_result = if method == "POST" {
+            self.http_client.post_form(&parsed, body).await
+        } else {
+            self.http_client.fetch(&parsed).await
+        };
+
+        match fetch_result {
+            Ok(resp) => {
+                self.record_network_event(url_str, method, resource_type, resp.status, &resp.headers, resp.body.len());
+                Some(resp)
+            }
+            Err(e) => {
+                tracing::warn!("Failed to fetch {} {}: {}", resource_type, url_str, e);
+                None
+            }
+        }
+    }
+
     async fn do_fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
         #[cfg(feature = "stealth")]
         if let Some(ref stealth) = self.stealth_client {
@@ -371,12 +457,22 @@ impl Page {
                     );
                     continue;
                 }
-                if self.should_block_url(&full_url) {
-                    tracing::info!("Blocked script by interception: {}", full_url);
-                    continue;
+                if self.should_block_url(&full_url) || self.intercept_enabled {
+                    // 通过统一拦截通道获取脚本（发送 CDP 事件 → Go handler → Fulfill/Continue/Fail）
+                    if let Some(resp) = self.fetch_url_with_intercept(&full_url, "Script", "GET", "").await {
+                        let code = String::from_utf8_lossy(&resp.body).to_string();
+                        self.record_network_event(&full_url, "GET", "Script", resp.status, &resp.headers, resp.body.len());
+                        if let Some(js) = &mut self.js {
+                            tracing::info!("Executing script ({} bytes): {}", code.len(), full_url);
+                            if let Err(e) = js.execute_script_guarded(&full_url, &code) {
+                                tracing::warn!("Script error ({}): {}", full_url, e);
+                            }
+                        }
+                    }
+                } else {
+                    resolved.push((i, full_url.clone()));
+                    fetch_tasks.push((i, full_url));
                 }
-                resolved.push((i, full_url.clone()));
-                fetch_tasks.push((i, full_url));
             }
         }
 
@@ -628,10 +724,66 @@ impl Page {
             let mut headers = std::collections::HashMap::new();
             headers.insert("content-type".to_string(), content_type);
             Ok(obscura_net::Response { url: url.clone(), status: 200, headers, body: body_bytes, redirected_from: Vec::new() })
-        } else if method == "POST" {
-            self.http_client.post_form(&url, body).await
         } else {
-            self.do_fetch(&url).await
+            // 主文档请求拦截：如果 Fetch 拦截已启用，先通过 intercept_tx 发送到 CDP 客户端，
+            // 等待 Go 端通过 Fetch.fulfillRequest / Fetch.continueRequest 决定如何处理。
+            // Go 端可以用自己的 HTTP 客户端（TLS/代理/重定向控制）获取内容并注入。
+            if self.intercept_enabled {
+                if let Some(ref tx) = self.intercept_tx {
+                    let (resolver_tx, resolver_rx) = tokio::sync::oneshot::channel();
+                    let request_id = format!("doc-{}", self.network_event_counter);
+                    self.network_event_counter += 1;
+
+                    let mut req_headers = std::collections::HashMap::new();
+                    req_headers.insert("user-agent".to_string(), "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36".to_string());
+
+                    let intercepted = InterceptedRequest {
+                        request_id: request_id.clone(),
+                        url: url.to_string(),
+                        method: method.to_string(),
+                        headers: req_headers,
+                        resource_type: "Document".to_string(),
+                        resolver: resolver_tx,
+                    };
+
+                    let _ = tx.send(intercepted);
+
+                    match resolver_rx.await {
+                        Ok(InterceptResolution::Fulfill { status, headers: resp_headers, body }) => {
+                            let body_bytes = body.into_bytes();
+                            Ok(obscura_net::Response {
+                                url: url.clone(),
+                                status,
+                                headers: resp_headers,
+                                body: body_bytes,
+                                redirected_from: Vec::new(),
+                            })
+                        }
+                        Ok(InterceptResolution::Fail { reason }) => {
+                            Err(ObscuraNetError::Network(reason))
+                        }
+                        Ok(InterceptResolution::Continue { .. }) | Err(_) => {
+                            // 继续走正常请求路径
+                            if method == "POST" {
+                                self.http_client.post_form(&url, body).await
+                            } else {
+                                self.do_fetch(&url).await
+                            }
+                        }
+                    }
+                } else {
+                    // intercept_enabled 但 intercept_tx 未设置，走正常路径
+                    if method == "POST" {
+                        self.http_client.post_form(&url, body).await
+                    } else {
+                        self.do_fetch(&url).await
+                    }
+                }
+            } else if method == "POST" {
+                self.http_client.post_form(&url, body).await
+            } else {
+                self.do_fetch(&url).await
+            }
         }.map_err(|e| {
             self.lifecycle = LifecycleState::Failed;
             PageError::NetworkError(e.to_string())
@@ -675,6 +827,7 @@ impl Page {
             .collect();
 
         let mut css_fetch_urls: Vec<String> = Vec::new();
+        let mut css_sources = Vec::new();
         for href in &stylesheet_urls {
             let full_url = if href.starts_with("http://") || href.starts_with("https://") {
                 href.clone()
@@ -691,11 +844,16 @@ impl Page {
                 );
                 continue;
             }
-            if self.should_block_url(&full_url) {
-                tracing::info!("Blocked stylesheet by interception: {}", full_url);
-                continue;
+            if self.should_block_url(&full_url) || self.intercept_enabled {
+                // 通过统一拦截通道获取 CSS（发送 CDP 事件 → Go handler）
+                if let Some(resp) = self.fetch_url_with_intercept(&full_url, "Stylesheet", "GET", "").await {
+                    let css = String::from_utf8_lossy(&resp.body).to_string();
+                    self.record_network_event(&full_url, "GET", "Stylesheet", resp.status, &resp.headers, resp.body.len());
+                    css_sources.push(css);
+                }
+            } else {
+                css_fetch_urls.push(full_url);
             }
-            css_fetch_urls.push(full_url);
         }
 
         let client = self.http_client.clone();
@@ -715,7 +873,6 @@ impl Page {
         }).collect();
 
         let css_results = futures::future::join_all(css_futures).await;
-        let mut css_sources = Vec::new();
         for result in css_results {
             if let Some((url_str, resp)) = result {
                 let css = String::from_utf8_lossy(&resp.body).to_string();

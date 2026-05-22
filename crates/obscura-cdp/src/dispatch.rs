@@ -205,10 +205,23 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
         "Storage" => domains::storage::handle(method, &req.params, ctx, &req.session_id).await,
         "LP" => domains::lp::handle(method, &req.params, ctx, &req.session_id).await,
         "Accessibility" => domains::accessibility::handle(method, &req.params, ctx, &req.session_id).await,
+        "Security" => {
+            match method {
+                "setIgnoreCertificateErrors" => {
+                    let ignore = req.params.get("ignore").and_then(|v| v.as_bool()).unwrap_or(false);
+                    ctx.default_context.http_client.set_allow_invalid_certs(ignore);
+                    for page in &ctx.pages {
+                        page.http_client.set_allow_invalid_certs(ignore);
+                    }
+                    Ok(json!({}))
+                }
+                _ => Ok(json!({})),
+            }
+        }
         // Accepted but no-op. Puppeteer's FrameManager.initialize calls
         // Audits.enable on connect — refusing it breaks puppeteer.connect()
         // before any user code runs.
-        "Emulation" | "Log" | "Performance" | "Security" | "CSS"
+        "Emulation" | "Log" | "Performance" | "CSS"
         | "ServiceWorker" | "Inspector"
         | "Debugger" | "Profiler" | "HeapProfiler" | "Overlay"
         | "Audits" => {
