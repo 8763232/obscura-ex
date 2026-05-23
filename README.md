@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/h4ckf0r0day/obscura/main/assets/icon.png" alt="Obscura" width="80" />
+  <img src="https://raw.githubusercontent.com/8763232/obscura-ex/main/assets/icon.png" alt="Obscura" width="80" />
 </p>
 
 <h2 align="center">Obscura</h2>
@@ -48,18 +48,18 @@ tar xzf obscura-x86_64-linux.tar.gz
 ./obscura fetch https://example.com --eval "document.title"
 
 # Linux ARM64 (aarch64)
-curl -LO https://github.com/h4ckf0r0day/obscura/releases/latest/download/obscura-aarch64-linux.tar.gz
+curl -LO https://github.com/8763232/obscura-ex/releases/latest/download/obscura-aarch64-linux.tar.gz
 tar xzf obscura-aarch64-linux.tar.gz
 
 # Arch Linux (AUR)
 yay -S obscura-browser
 
 # macOS Apple Silicon
-curl -LO https://github.com/h4ckf0r0day/obscura/releases/latest/download/obscura-aarch64-macos.tar.gz
+curl -LO https://github.com/8763232/obscura-ex/releases/latest/download/obscura-aarch64-macos.tar.gz
 tar xzf obscura-aarch64-macos.tar.gz
 
 # macOS Intel
-curl -LO https://github.com/h4ckf0r0day/obscura/releases/latest/download/obscura-x86_64-macos.tar.gz
+curl -LO https://github.com/8763232/obscura-ex/releases/latest/download/obscura-x86_64-macos.tar.gz
 tar xzf obscura-x86_64-macos.tar.gz
 
 # Windows
@@ -84,7 +84,7 @@ Image on [Docker Hub](https://hub.docker.com/r/h4ckf0r0day/obscura). Multi-stage
 ### Build from source
 
 ```bash
-git clone https://github.com/h4ckf0r0day/obscura.git
+git clone https://github.com/8763232/obscura-ex.git
 cd obscura
 cargo build --release
 
@@ -357,6 +357,16 @@ Optional flags (both transports):
 | `browser_network_requests` | List network requests made by the current page |
 | `browser_console_messages` | Return console messages logged by the page |
 | `browser_close` | Close the page and reset browser state |
+
+## Changelog
+
+### v0.1.6 (unreleased)
+- **LoadResponse 手动重定向**: handler 可见的每一步 302，可中断或修改重定向目标
+- **CookieJar 持久化**: 跨请求共享，Set-Cookie 累积收集并支持注入
+- **安全: file:// 导航保护**: CDP `Page.navigate` 对 file:// 默认拒绝，需 `--allow-file-access` 显式开启
+- **fix: --stealth + socks5:// 组合报错**: CLI 在启动时明确拒绝，避免静默失败
+- **fix: 脚本错误隔离**: 单个页面的 TypeError 不影响后续脚本执行
+- **aarch64-linux CI**: 新增 ARM64 二进制构建
 
 ## License
 
