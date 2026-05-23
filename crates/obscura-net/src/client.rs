@@ -202,7 +202,7 @@ impl ObscuraHttpClient {
         let mut builder = Client::builder()
             .redirect(Policy::none())
             .timeout(Duration::from_secs(30))
-            .danger_accept_invalid_certs(self.allow_invalid_certs.load(Ordering::Relaxed));
+            .danger_accept_invalid_certs(true);
 
         if let Some(ref proxy) = self.proxy_url {
             if let Ok(p) = reqwest::Proxy::all(proxy.as_str()) {

@@ -10,3 +10,10 @@ RUST_TEST_THREADS = "1"
 # it doesn't exist. See: https://github.com/h4ckf0r0day/obscura/issues/136
 CXXFLAGS = { value = "-isystem /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1", force = false }
 SDKROOT  = { value = "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk", force = false }
+
+[target.x86_64-unknown-linux-musl]
+rustflags = ["-C", "target-feature=-crt-static", "-C", "link-self-contained=yes"]
+
+[profile.release]
+lto = false
+codegen-units = 1

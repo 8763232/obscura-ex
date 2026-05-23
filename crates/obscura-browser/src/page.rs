@@ -378,9 +378,12 @@ impl Page {
     }
 
     async fn do_fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
+        // 代理模式下跳过 stealth（wreq 不支持 MITM 代理的 CA 证书信任）
         #[cfg(feature = "stealth")]
         if let Some(ref stealth) = self.stealth_client {
-            return stealth.fetch(url).await;
+            if self.http_client.proxy_url().is_none() {
+                return stealth.fetch(url).await;
+            }
         }
         self.http_client.fetch(url).await
     }
